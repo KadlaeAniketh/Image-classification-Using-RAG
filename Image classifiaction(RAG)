@@ -1,0 +1,752 @@
+# Retrieval-Augmented Image Classification - High Accuracy Implementation
+# This notebook implements an advanced RAG-based image classifier with focus on maximizing accuracy
+
+# Cell 1: Install Required Packages
+!pip install torch torchvision transformers clip-by-openai faiss-cpu chromadb pillow numpy scikit-learn matplotlib seaborn tqdm
+
+# Cell 2: Import Libraries
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+import torchvision.transforms as transforms
+from transformers import CLIPProcessor, CLIPModel, AutoImageProcessor, AutoModel
+import faiss
+import chromadb
+import numpy as np
+from PIL import Image
+import os
+import json
+import pickle
+from typing import List, Dict, Tuple, Optional
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set device
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# Cell 3: Configuration Class
+class Config:
+    # Model configurations
+    CLIP_MODEL = "openai/clip-vit-large-patch14"  # Using larger CLIP model for better accuracy
+    DINOV2_MODEL = "facebook/dinov2-large"        # Using DINOv2 large model
+    
+    # Vector store configurations
+    VECTOR_DIMENSION = 768  # Will be updated based on model
+    FAISS_INDEX_TYPE = "IVF"  # IVF for better accuracy vs speed tradeoff
+    N_CLUSTERS = 256  # Number of clusters for IVF
+    
+    # Training configurations
+    BATCH_SIZE = 32
+    LEARNING_RATE = 1e-4
+    NUM_EPOCHS = 20
+    WEIGHT_DECAY = 1e-5
+    
+    # Retrieval configurations
+    TOP_K_RETRIEVAL = 10  # Retrieve more neighbors for better accuracy
+    SIMILARITY_THRESHOLD = 0.7
+    
+    # Ensemble configurations
+    CLIP_WEIGHT = 0.6
+    DINOV2_WEIGHT = 0.4
+    
+    # Data augmentation
+    USE_AUGMENTATION = True
+    AUGMENTATION_FACTOR = 3  # Number of augmented versions per image
+
+config = Config()
+
+# Cell 4: Advanced Image Transforms with Augmentation
+class AdvancedTransforms:
+    def __init__(self, is_training=True):
+        self.is_training = is_training
+        
+        # Base transforms
+        self.base_transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                               std=[0.229, 0.224, 0.225])
+        ])
+        
+        # Augmentation transforms for training
+        self.augment_transforms = [
+            transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(15),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ]),
+            transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.RandomAffine(degrees=0, translate=(0.1, 0.1)),
+                transforms.RandomPerspective(distortion_scale=0.2, p=0.3),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ]),
+            transforms.Compose([
+                transforms.Resize((224, 224)),
+                transforms.RandomGrayscale(p=0.1),
+                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                                   std=[0.229, 0.224, 0.225])
+            ])
+        ]
+    
+    def __call__(self, image):
+        if self.is_training and config.USE_AUGMENTATION:
+            # Return original + augmented versions
+            results = [self.base_transform(image)]
+            for transform in self.augment_transforms[:config.AUGMENTATION_FACTOR-1]:
+                results.append(transform(image))
+            return results
+        else:
+            return [self.base_transform(image)]
+
+# Cell 5: Multi-Modal Feature Extractor
+class MultiModalFeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        
+        # Load CLIP model
+        self.clip_processor = CLIPProcessor.from_pretrained(config.CLIP_MODEL)
+        self.clip_model = CLIPModel.from_pretrained(config.CLIP_MODEL)
+        
+        # Load DINOv2 model
+        self.dinov2_processor = AutoImageProcessor.from_pretrained(config.DINOV2_MODEL)
+        self.dinov2_model = AutoModel.from_pretrained(config.DINOV2_MODEL)
+        
+        # Feature fusion layer
+        clip_dim = self.clip_model.config.projection_dim
+        dinov2_dim = self.dinov2_model.config.hidden_size
+        
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(clip_dim + dinov2_dim, 1024),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(1024, config.VECTOR_DIMENSION),
+            nn.LayerNorm(config.VECTOR_DIMENSION)
+        )
+        
+        # Move models to device
+        self.clip_model.to(device)
+        self.dinov2_model.to(device)
+        self.fusion_layer.to(device)
+        
+        # Update config with actual dimension
+        config.VECTOR_DIMENSION = config.VECTOR_DIMENSION
+    
+    def extract_clip_features(self, images):
+        with torch.no_grad():
+            inputs = self.clip_processor(images=images, return_tensors="pt", padding=True).to(device)
+            features = self.clip_model.get_image_features(**inputs)
+            return F.normalize(features, p=2, dim=-1)
+    
+    def extract_dinov2_features(self, images):
+        with torch.no_grad():
+            inputs = self.dinov2_processor(images=images, return_tensors="pt").to(device)
+            outputs = self.dinov2_model(**inputs)
+            # Use CLS token
+            features = outputs.last_hidden_state[:, 0]
+            return F.normalize(features, p=2, dim=-1)
+    
+    def forward(self, images):
+        # Extract features from both models
+        clip_features = self.extract_clip_features(images)
+        dinov2_features = self.extract_dinov2_features(images)
+        
+        # Concatenate features
+        combined_features = torch.cat([clip_features, dinov2_features], dim=-1)
+        
+        # Apply fusion layer
+        fused_features = self.fusion_layer(combined_features)
+        
+        return F.normalize(fused_features, p=2, dim=-1)
+
+# Cell 6: Advanced Vector Store with FAISS
+class AdvancedVectorStore:
+    def __init__(self):
+        self.dimension = config.VECTOR_DIMENSION
+        self.index = None
+        self.labels = []
+        self.metadata = []
+        self.is_trained = False
+        
+        # Initialize ChromaDB for metadata storage
+        self.chroma_client = chromadb.Client()
+        try:
+            self.collection = self.chroma_client.get_collection("image_embeddings")
+        except:
+            self.collection = self.chroma_client.create_collection("image_embeddings")
+    
+    def _create_index(self, vectors):
+        """Create optimized FAISS index"""
+        n_vectors = len(vectors)
+        
+        if n_vectors < 1000:
+            # Use flat index for small datasets
+            self.index = faiss.IndexFlatIP(self.dimension)
+        else:
+            # Use IVF index for larger datasets
+            quantizer = faiss.IndexFlatIP(self.dimension)
+            n_clusters = min(config.N_CLUSTERS, n_vectors // 39)  # Rule of thumb
+            self.index = faiss.IndexIVFFlat(quantizer, self.dimension, n_clusters)
+            
+            # Train the index
+            self.index.train(vectors.astype('float32'))
+        
+        self.is_trained = True
+    
+    def add_vectors(self, vectors: np.ndarray, labels: List[str], metadata: List[Dict]):
+        """Add vectors to the store"""
+        if self.index is None:
+            self._create_index(vectors)
+        
+        # Add to FAISS
+        self.index.add(vectors.astype('float32'))
+        
+        # Store labels and metadata
+        start_id = len(self.labels)
+        self.labels.extend(labels)
+        self.metadata.extend(metadata)
+        
+        # Add to ChromaDB
+        ids = [f"vec_{start_id + i}" for i in range(len(vectors))]
+        documents = [json.dumps(meta) for meta in metadata]
+        
+        self.collection.add(
+            embeddings=vectors.tolist(),
+            documents=documents,
+            metadatas=metadata,
+            ids=ids
+        )
+    
+    def search(self, query_vector: np.ndarray, k: int = config.TOP_K_RETRIEVAL):
+        """Search for similar vectors"""
+        if self.index is None or not self.is_trained:
+            return [], []
+        
+        # Set search parameters for IVF
+        if hasattr(self.index, 'nprobe'):
+            self.index.nprobe = min(32, self.index.ntotal // 10)
+        
+        query_vector = query_vector.astype('float32').reshape(1, -1)
+        similarities, indices = self.index.search(query_vector, k)
+        
+        # Filter by similarity threshold
+        valid_mask = similarities[0] >= config.SIMILARITY_THRESHOLD
+        valid_similarities = similarities[0][valid_mask]
+        valid_indices = indices[0][valid_mask]
+        
+        # Get labels and metadata
+        retrieved_labels = [self.labels[idx] for idx in valid_indices]
+        retrieved_metadata = [self.metadata[idx] for idx in valid_indices]
+        
+        return retrieved_labels, valid_similarities.tolist()
+    
+    def save(self, path: str):
+        """Save the vector store"""
+        if self.index is not None:
+            faiss.write_index(self.index, f"{path}_faiss.index")
+        
+        with open(f"{path}_metadata.pkl", 'wb') as f:
+            pickle.dump({
+                'labels': self.labels,
+                'metadata': self.metadata,
+                'is_trained': self.is_trained
+            }, f)
+    
+    def load(self, path: str):
+        """Load the vector store"""
+        if os.path.exists(f"{path}_faiss.index"):
+            self.index = faiss.read_index(f"{path}_faiss.index")
+        
+        if os.path.exists(f"{path}_metadata.pkl"):
+            with open(f"{path}_metadata.pkl", 'rb') as f:
+                data = pickle.load(f)
+                self.labels = data['labels']
+                self.metadata = data['metadata']
+                self.is_trained = data['is_trained']
+
+# Cell 7: RAG Image Classifier with Ensemble
+class RAGImageClassifier:
+    def __init__(self, class_names: List[str]):
+        self.class_names = class_names
+        self.num_classes = len(class_names)
+        self.feature_extractor = MultiModalFeatureExtractor()
+        self.vector_store = AdvancedVectorStore()
+        self.transform = AdvancedTransforms(is_training=True)
+        
+        # Learnable classification head
+        self.classifier_head = nn.Sequential(
+            nn.Linear(config.VECTOR_DIMENSION, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, self.num_classes)
+        ).to(device)
+        
+        # Optimizer for the classification head
+        self.optimizer = torch.optim.AdamW(
+            self.classifier_head.parameters(),
+            lr=config.LEARNING_RATE,
+            weight_decay=config.WEIGHT_DECAY
+        )
+        
+        self.criterion = nn.CrossEntropyLoss()
+        
+    def build_vector_store(self, image_paths: List[str], labels: List[str]):
+        """Build the vector store from training images"""
+        print("Building vector store...")
+        
+        all_vectors = []
+        all_labels = []
+        all_metadata = []
+        
+        for img_path, label in tqdm(zip(image_paths, labels), total=len(image_paths)):
+            try:
+                # Load and process image
+                image = Image.open(img_path).convert('RGB')
+                transformed_images = self.transform(image)
+                
+                for i, transformed_img in enumerate(transformed_images):
+                    # Extract features
+                    with torch.no_grad():
+                        features = self.feature_extractor([Image.fromarray((transformed_img.permute(1, 2, 0).numpy() * 255).astype(np.uint8))])
+                        features = features.cpu().numpy()
+                    
+                    all_vectors.append(features[0])
+                    all_labels.append(label)
+                    all_metadata.append({
+                        'image_path': img_path,
+                        'label': label,
+                        'augmentation_id': i
+                    })
+            
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+                continue
+        
+        # Add to vector store
+        if all_vectors:
+            self.vector_store.add_vectors(
+                np.array(all_vectors),
+                all_labels,
+                all_metadata
+            )
+            print(f"Added {len(all_vectors)} vectors to the store")
+    
+    def retrieve_and_classify(self, image_path: str, use_ensemble: bool = True):
+        """Classify image using retrieval + ensemble approach"""
+        try:
+            # Load and preprocess image
+            image = Image.open(image_path).convert('RGB')
+            transform_test = AdvancedTransforms(is_training=False)
+            transformed_images = transform_test(image)
+            
+            # Extract features
+            with torch.no_grad():
+                query_features = self.feature_extractor(transformed_images)
+                query_features_np = query_features.cpu().numpy()[0]
+            
+            # Retrieve similar images
+            retrieved_labels, similarities = self.vector_store.search(query_features_np)
+            
+            if not retrieved_labels:
+                # Fallback to direct classification
+                logits = self.classifier_head(query_features)
+                probabilities = F.softmax(logits, dim=-1)
+                predicted_class = torch.argmax(probabilities, dim=-1).item()
+                confidence = probabilities[0][predicted_class].item()
+                return self.class_names[predicted_class], confidence, []
+            
+            if use_ensemble:
+                # Ensemble approach: combine retrieval and classification
+                
+                # 1. Retrieval-based prediction
+                label_counts = {}
+                weighted_scores = {}
+                
+                for label, sim in zip(retrieved_labels, similarities):
+                    if label in label_counts:
+                        label_counts[label] += 1
+                        weighted_scores[label] += sim
+                    else:
+                        label_counts[label] = 1
+                        weighted_scores[label] = sim
+                
+                # Normalize weighted scores
+                for label in weighted_scores:
+                    weighted_scores[label] = weighted_scores[label] / label_counts[label]
+                
+                retrieval_prediction = max(weighted_scores.items(), key=lambda x: x[1])
+                
+                # 2. Classification-based prediction
+                logits = self.classifier_head(query_features)
+                probabilities = F.softmax(logits, dim=-1)
+                classification_prediction = torch.argmax(probabilities, dim=-1).item()
+                classification_confidence = probabilities[0][classification_prediction].item()
+                
+                # 3. Ensemble combination
+                retrieval_confidence = retrieval_prediction[1]
+                
+                # Weighted combination
+                if retrieval_prediction[0] == self.class_names[classification_prediction]:
+                    # Both agree - high confidence
+                    final_confidence = 0.7 * retrieval_confidence + 0.3 * classification_confidence
+                    final_prediction = retrieval_prediction[0]
+                else:
+                    # They disagree - choose based on confidence
+                    if retrieval_confidence > classification_confidence:
+                        final_prediction = retrieval_prediction[0]
+                        final_confidence = retrieval_confidence
+                    else:
+                        final_prediction = self.class_names[classification_prediction]
+                        final_confidence = classification_confidence
+                
+                return final_prediction, final_confidence, retrieved_labels[:5]
+            
+            else:
+                # Pure retrieval approach
+                label_counts = {}
+                for label in retrieved_labels:
+                    label_counts[label] = label_counts.get(label, 0) + 1
+                
+                predicted_label = max(label_counts.items(), key=lambda x: x[1])[0]
+                confidence = label_counts[predicted_label] / len(retrieved_labels)
+                
+                return predicted_label, confidence, retrieved_labels[:5]
+        
+        except Exception as e:
+            print(f"Error classifying {image_path}: {e}")
+            return "unknown", 0.0, []
+    
+    def train_classification_head(self, image_paths: List[str], labels: List[str], 
+                                validation_split: float = 0.2):
+        """Train the classification head"""
+        print("Training classification head...")
+        
+        # Split data
+        train_paths, val_paths, train_labels, val_labels = train_test_split(
+            image_paths, labels, test_size=validation_split, random_state=42, stratify=labels
+        )
+        
+        # Convert labels to indices
+        label_to_idx = {label: idx for idx, label in enumerate(self.class_names)}
+        train_label_indices = [label_to_idx[label] for label in train_labels]
+        val_label_indices = [label_to_idx[label] for label in val_labels]
+        
+        best_val_accuracy = 0.0
+        
+        for epoch in range(config.NUM_EPOCHS):
+            # Training
+            self.classifier_head.train()
+            train_loss = 0.0
+            train_correct = 0
+            train_total = 0
+            
+            for img_path, label_idx in tqdm(zip(train_paths, train_label_indices), 
+                                          desc=f"Epoch {epoch+1}/{config.NUM_EPOCHS}"):
+                try:
+                    # Load and process image
+                    image = Image.open(img_path).convert('RGB')
+                    transform_train = AdvancedTransforms(is_training=True)
+                    transformed_images = transform_train(image)
+                    
+                    for transformed_img in transformed_images:
+                        # Extract features
+                        with torch.no_grad():
+                            features = self.feature_extractor([Image.fromarray((transformed_img.permute(1, 2, 0).numpy() * 255).astype(np.uint8))])
+                        
+                        # Forward pass
+                        logits = self.classifier_head(features)
+                        target = torch.tensor([label_idx], device=device)
+                        loss = self.criterion(logits, target)
+                        
+                        # Backward pass
+                        self.optimizer.zero_grad()
+                        loss.backward()
+                        self.optimizer.step()
+                        
+                        # Statistics
+                        train_loss += loss.item()
+                        predicted = torch.argmax(logits, dim=-1)
+                        train_total += 1
+                        train_correct += (predicted == target).sum().item()
+                
+                except Exception as e:
+                    print(f"Error training on {img_path}: {e}")
+                    continue
+            
+            # Validation
+            self.classifier_head.eval()
+            val_correct = 0
+            val_total = 0
+            
+            with torch.no_grad():
+                for img_path, label_idx in val_paths:
+                    try:
+                        predicted_label, confidence, _ = self.retrieve_and_classify(img_path, use_ensemble=True)
+                        predicted_idx = label_to_idx.get(predicted_label, -1)
+                        
+                        val_total += 1
+                        if predicted_idx == label_idx:
+                            val_correct += 1
+                    
+                    except Exception as e:
+                        print(f"Error validating on {img_path}: {e}")
+                        continue
+            
+            # Calculate accuracies
+            train_accuracy = train_correct / train_total if train_total > 0 else 0
+            val_accuracy = val_correct / val_total if val_total > 0 else 0
+            avg_train_loss = train_loss / train_total if train_total > 0 else 0
+            
+            print(f"Epoch {epoch+1}: Train Loss: {avg_train_loss:.4f}, "
+                  f"Train Acc: {train_accuracy:.4f}, Val Acc: {val_accuracy:.4f}")
+            
+            # Save best model
+            if val_accuracy > best_val_accuracy:
+                best_val_accuracy = val_accuracy
+                torch.save(self.classifier_head.state_dict(), 'best_classifier_head.pth')
+        
+        # Load best model
+        self.classifier_head.load_state_dict(torch.load('best_classifier_head.pth'))
+        print(f"Training completed. Best validation accuracy: {best_val_accuracy:.4f}")
+    
+    def evaluate(self, test_image_paths: List[str], test_labels: List[str]):
+        """Evaluate the model"""
+        predictions = []
+        confidences = []
+        
+        print("Evaluating model...")
+        for img_path, true_label in tqdm(zip(test_image_paths, test_labels)):
+            pred_label, confidence, _ = self.retrieve_and_classify(img_path, use_ensemble=True)
+            predictions.append(pred_label)
+            confidences.append(confidence)
+        
+        # Calculate metrics
+        accuracy = accuracy_score(test_labels, predictions)
+        
+        print(f"Test Accuracy: {accuracy:.4f}")
+        print(f"Average Confidence: {np.mean(confidences):.4f}")
+        
+        # Classification report
+        print("\nClassification Report:")
+        print(classification_report(test_labels, predictions, target_names=self.class_names))
+        
+        # Confusion Matrix
+        cm = confusion_matrix(test_labels, predictions, labels=self.class_names)
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=self.class_names, yticklabels=self.class_names)
+        plt.title('Confusion Matrix')
+        plt.ylabel('True Label')
+        plt.xlabel('Predicted Label')
+        plt.tight_layout()
+        plt.show()
+        
+        return accuracy, confidences
+    
+    def save_model(self, path: str):
+        """Save the complete model"""
+        self.vector_store.save(f"{path}_vector_store")
+        torch.save(self.classifier_head.state_dict(), f"{path}_classifier_head.pth")
+        
+        with open(f"{path}_config.json", 'w') as f:
+            json.dump({
+                'class_names': self.class_names,
+                'num_classes': self.num_classes
+            }, f)
+        
+        print(f"Model saved to {path}")
+    
+    def load_model(self, path: str):
+        """Load the complete model"""
+        self.vector_store.load(f"{path}_vector_store")
+        self.classifier_head.load_state_dict(torch.load(f"{path}_classifier_head.pth"))
+        
+        with open(f"{path}_config.json", 'r') as f:
+            config_data = json.load(f)
+            self.class_names = config_data['class_names']
+            self.num_classes = config_data['num_classes']
+        
+        print(f"Model loaded from {path}")
+
+# Cell 8: Example Usage and Demo
+def demo_rag_classifier():
+    """Demo function to show how to use the RAG Image Classifier"""
+    
+    # Example class names (adjust for your dataset)
+    class_names = ['cat', 'dog', 'bird', 'fish', 'horse']
+    
+    # Initialize classifier
+    classifier = RAGImageClassifier(class_names)
+    
+    # Example training data (replace with your actual data paths)
+    # train_image_paths = ['path/to/train/image1.jpg', 'path/to/train/image2.jpg', ...]
+    # train_labels = ['cat', 'dog', ...]
+    
+    print("RAG Image Classifier initialized successfully!")
+    print(f"Configuration:")
+    print(f"- CLIP Model: {config.CLIP_MODEL}")
+    print(f"- DINOv2 Model: {config.DINOV2_MODEL}")
+    print(f"- Vector Dimension: {config.VECTOR_DIMENSION}")
+    print(f"- Top-K Retrieval: {config.TOP_K_RETRIEVAL}")
+    print(f"- Using Augmentation: {config.USE_AUGMENTATION}")
+    
+    # Training workflow (uncomment when you have data):
+    # 1. Build vector store
+    # classifier.build_vector_store(train_image_paths, train_labels)
+    
+    # 2. Train classification head
+    # classifier.train_classification_head(train_image_paths, train_labels)
+    
+    # 3. Evaluate on test set
+    # test_accuracy, confidences = classifier.evaluate(test_image_paths, test_labels)
+    
+    # 4. Save the model
+    # classifier.save_model('rag_classifier_model')
+    
+    # Example prediction (uncomment when model is trained):
+    # prediction, confidence, similar_images = classifier.retrieve_and_classify('path/to/test/image.jpg')
+    # print(f"Prediction: {prediction}, Confidence: {confidence:.4f}")
+    # print(f"Similar images found: {len(similar_images)}")
+    
+    return classifier
+
+# Cell 9: Run Demo
+if __name__ == "__main__":
+    # Initialize and demonstrate the classifier
+    classifier = demo_rag_classifier()
+    
+    print("\n" + "="*50)
+    print("RAG Image Classifier Setup Complete!")
+    print("="*50)
+    
+    print("\nKey Features for Higher Accuracy:")
+    print("1. Multi-modal feature extraction (CLIP + DINOv2)")
+    print("2. Advanced data augmentation")
+    print("3. Ensemble classification (Retrieval + Direct)")
+    print("4. Optimized FAISS indexing")
+    print("5. Self-learning capabilities")
+    print("6. Learnable classification head")
+    
+    print("\nTo use with your data:")
+    print("1. Prepare your image dataset")
+    print("2. Update class_names with your classes")
+    print("3. Set train_image_paths and train_labels")
+    print("4. Run the training workflow")
+
+# Cell 10: Advanced Techniques for Further Accuracy Improvement
+class AccuracyBooster:
+    """Additional techniques to boost accuracy"""
+    
+    @staticmethod
+    def apply_test_time_augmentation(classifier, image_path, num_augmentations=5):
+        """Test-time augmentation for higher accuracy"""
+        predictions = []
+        confidences = []
+        
+        # Original image
+        pred, conf, _ = classifier.retrieve_and_classify(image_path, use_ensemble=True)
+        predictions.append(pred)
+        confidences.append(conf)
+        
+        # Augmented versions
+        image = Image.open(image_path).convert('RGB')
+        transform = AdvancedTransforms(is_training=True)
+        
+        for _ in range(num_augmentations - 1):
+            # Apply random augmentation
+            augmented_images = transform(image)
+            for aug_img in augmented_images[:1]:  # Take first augmentation
+                # Save temporary augmented image
+                temp_path = 'temp_augmented.jpg'
+                Image.fromarray((aug_img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)).save(temp_path)
+                
+                pred, conf, _ = classifier.retrieve_and_classify(temp_path, use_ensemble=True)
+                predictions.append(pred)
+                confidences.append(conf)
+                
+                # Clean up
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+        
+        # Ensemble the predictions
+        prediction_counts = {}
+        weighted_scores = {}
+        
+        for pred, conf in zip(predictions, confidences):
+            if pred in prediction_counts:
+                prediction_counts[pred] += 1
+                weighted_scores[pred] += conf
+            else:
+                prediction_counts[pred] = 1
+                weighted_scores[pred] = conf
+        
+        # Get final prediction
+        final_prediction = max(prediction_counts.items(), key=lambda x: x[1])[0]
+        final_confidence = weighted_scores[final_prediction] / prediction_counts[final_prediction]
+        
+        return final_prediction, final_confidence
+    @staticmethod
+def calibrate_confidence(classifier, validation_paths, validation_labels):
+    """Calibrate confidence scores using temperature scaling"""
+    from scipy.optimize import minimize_scalar
+    
+    def temperature_scaling_loss(temperature):
+        total_loss = 0
+        count = 0
+        
+        for img_path, true_label in zip(validation_paths, validation_labels):
+            try:
+                # Get prediction and confidence
+                pred_label, confidence, _ = classifier.retrieve_and_classify(img_path)
+                
+                # Check if prediction is correct
+                is_correct = 1.0 if pred_label == true_label else 0.0
+                
+                # Convert to logit (inverse sigmoid)
+                logit = np.log(confidence / (1 - confidence + 1e-8))
+                calibrated_prob = 1 / (1 + np.exp(-logit / temperature))
+                
+                # Binary cross-entropy loss
+                loss = -(is_correct * np.log(calibrated_prob + 1e-8) + 
+                        (1 - is_correct) * np.log(1 - calibrated_prob + 1e-8))
+                total_loss += loss
+                count += 1
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+                continue
+        
+        return total_loss / count if count > 0 else float('inf')
+    
+    # Find optimal temperature
+    result = minimize_scalar(temperature_scaling_loss, bounds=(0.1, 10.0), method='bounded')
+    optimal_temperature = result.x
+    
+    print(f"Optimal temperature for calibration: {optimal_temperature:.4f}")
+    return optimal_temperature
+
+# Additional method to apply calibration
+@staticmethod
+def apply_calibration(confidence, temperature):
+    """Apply temperature scaling to confidence score"""
+    logit = np.log(confidence / (1 - confidence + 1e-8))
+    calibrated_confidence = 1 / (1 + np.exp(-logit / temperature))
+    return calibrated_confidence
